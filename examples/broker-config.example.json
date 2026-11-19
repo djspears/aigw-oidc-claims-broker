@@ -1,0 +1,20 @@
+{
+  "issuer": "https://idp.example.com/oauth2/default",
+  "audience": [],
+  "allowed_clients": ["<your-cli-client-id>"],
+  "algorithms": ["RS256"],
+  "userinfo": true,
+  "copy_claims": {
+    "tier": "tier",
+    "bu": "bu",
+    "product": "product",
+    "component": "component"
+  },
+  "required_claims": ["tier"],
+  "identity_claims": ["email", "preferred_username", "upn"],
+  "static_claims": {
+    "scopes": ["completions.write", "mcp.invoke"]
+  },
+  "token_ttl_seconds": 3600,
+  "cap_to_upstream_exp": true
+}

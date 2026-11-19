@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# aigw-exchange: Claude Code apiKeyHelper that turns your IdP access token into a broker-minted AI Gateway JWT.
+#
+#   IdP helper (e.g. aigw-token) --IdP access token--> broker /token/exchange --gateway JWT (cached)--> stdout
+#
+# Usage: aigw-exchange [token|status|clear]      (default: token)
+# Settings (environment, or Claude Code settings.json "env"):
+#   AIGW_BROKER_URL        broker base URL, e.g. https://aigw-broker.example.com            (required)
+#   AIGW_IDP_TOKEN_CMD     command that prints a valid IdP *access token*, e.g. /usr/local/bin/aigw-token  (required)
+#   AIGW_EXCHANGE_CACHE    cache dir (default ~/.cache/aigw-exchange, mode 700)
+#   AIGW_EXCHANGE_MARGIN   renew when fewer than this many seconds are left (default 120)
+#   AIGW_EXCHANGE_LOG      optional log file, one line per run (never contains tokens)
+#   AIGW_HTTP_TIMEOUT      seconds for the broker call (default 15)
+set -euo pipefail
+
+: "${AIGW_BROKER_URL:?set AIGW_BROKER_URL}"
+: "${AIGW_IDP_TOKEN_CMD:?set AIGW_IDP_TOKEN_CMD}"
+CACHE_DIR=${AIGW_EXCHANGE_CACHE:-$HOME/.cache/aigw-exchange}
+MARGIN=${AIGW_EXCHANGE_MARGIN:-120}
+TIMEOUT=${AIGW_HTTP_TIMEOUT:-15}
+mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"
+KEY=$(printf '%s' "$AIGW_BROKER_URL|$AIGW_IDP_TOKEN_CMD" | cksum | cut -d' ' -f1)
+CACHE="$CACHE_DIR/$KEY.json"
+NOW=$(date +%s)
+
+log() { [ -z "${AIGW_EXCHANGE_LOG:-}" ] || printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$AIGW_EXCHANGE_LOG"; }
+die() { echo "aigw-exchange: $*" >&2; log "error: $*"; exit 1; }
+for t in curl jq; do command -v "$t" >/dev/null || die "missing required tool: $t"; done
+
+claims() {  # decode a JWT payload (base64url, no padding)
+  local p; p=$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')
+  while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+  printf '%s' "$p" | base64 -d 2>/dev/null || printf '%s' "$p" | base64 -D
+}
+
+cached() {
+  [ -f "$CACHE" ] || return 1
+  [ $(( $(jq -r '.exp // 0' "$CACHE") - NOW )) -gt "$MARGIN" ] || return 1
+  jq -er '.access_token' "$CACHE"
+}
+
+exchange() {
+  local idp resp code body at exp
+  idp=$(sh -c "$AIGW_IDP_TOKEN_CMD") || die "IdP token command failed: $AIGW_IDP_TOKEN_CMD"
+  idp=$(printf '%s' "$idp" | tr -d '[:space:]')
+  [ -n "$idp" ] || die "IdP token command printed nothing (sign in first)"
+  resp=$(printf 'Authorization: Bearer %s\n' "$idp" | curl -s --connect-timeout 5 -m "$TIMEOUT" -w '\n%{http_code}' \
+    -X POST -H @- "${AIGW_BROKER_URL%/}/token/exchange") || die "broker not reachable at $AIGW_BROKER_URL"
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}
+  if [ "$code" != 200 ]; then
+    die "broker refused the exchange (HTTP $code): $(jq -r '[.error, (.missing // [] | join(","))] | map(select(. != "")) | join(" ")' <<<"$body" 2>/dev/null || echo "$body")"
+  fi
+  at=$(jq -r '.access_token // empty' <<<"$body"); [ -n "$at" ] || die "broker response had no access_token"
+  exp=$(claims "$at" | jq -r '.exp // empty'); [ -n "$exp" ] || exp=$(( NOW + $(jq -r '.expires_in // 300' <<<"$body") ))
+  umask 077
+  jq -n --arg at "$at" --argjson exp "$exp" '{access_token: $at, exp: $exp}' >"$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
+  log "exchanged (expires in $(( exp - NOW ))s)"
+  printf '%s' "$at"
+}
+
+case ${1:-token} in
+  token)  if cached; then log "cached"; else exchange; fi ;;
+  status) [ -f "$CACHE" ] || { echo "No cached broker token."; exit 0; }
+          claims "$(jq -r .access_token "$CACHE")" | jq --argjson now "$NOW" 'del(.jti) + {expires_in: (.exp - $now)}' ;;
+  clear)  rm -f "$CACHE"; echo "Cleared the cached broker token." >&2 ;;
+  *)      echo "usage: aigw-exchange [token|status|clear]" >&2; exit 2 ;;
+esac

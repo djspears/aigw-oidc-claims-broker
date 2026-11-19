@@ -1,0 +1,15 @@
+{
+  "name": "aigw-oidc-claims-broker",
+  "version": "0.1.0",
+  "description": "Token broker for the Prisma AIRS AI Gateway: turns an IdP access token plus /userinfo claims into a short-lived gateway JWT with flat claims",
+  "private": true,
+  "license": "MIT",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
