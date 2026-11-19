@@ -40,6 +40,17 @@ The broker is called once per token lifetime, not per request. It is **not in th
 > Community project, not an official Palo Alto Networks product. MIT licensed. Adapted from
 > [thresh97/aigw-entra-jwt-broker](https://github.com/thresh97/aigw-entra-jwt-broker) (see *Credits*).
 
+## Key assumption: `/userinfo` answers for refreshed tokens
+The broker does not cache anything. On every exchange it asks the IdP's `/userinfo` **with the client's current access
+token** (from sign-in or from any later refresh). Most IdPs build the userinfo response from the user's profile at that
+moment, so the attributes come back even when the refreshed access token doesn't carry them. **Test this with your IdP
+before deploying** (see *Verify your IdP*). If your IdP drops the attributes from `/userinfo` too after a refresh, the
+broker refuses (`403 missing_required_claims`) instead of minting tokens without them; it can't fix that case.
+
+The broker needs **no credentials at the IdP**: it verifies tokens with the IdP's public JWKS and calls `/userinfo` with
+the user's own token. Its only secret is its own signing key. It's stateless: run as many replicas as you like behind a
+load balancer (they share the key secret).
+
 ## When to use it (and when not)
 | Situation | Use the broker? |
 |---|---|
@@ -59,6 +70,7 @@ Keycloak client configured like the problem IdP (`tier`/`bu` only in the ID toke
 |---|---|
 | User with `user_tier`: IdP access token | no `tier`/`bu` (reproduces the problem) |
 | Same token → broker | 200, minted JWT has `tier`, `bu`, `email_id`, `scopes`; 1 h, capped at the IdP token's expiry |
+| **Refreshed** access token (refresh grant, no custom claims) → broker | `/userinfo` still returns them → 200 with `tier`/`bu`; gateway 200 |
 | User without a tier | 403 `missing_required_claims: [tier]` (no claimless token is minted) |
 | ID token, garbage, expired, wrong issuer/audience/client, `alg: none`, foreign signature | 401 / 403 |
 | Raw IdP access token → gateway | 403 / error 033 (no gateway scope, no tier claim) |
@@ -66,6 +78,17 @@ Keycloak client configured like the problem IdP (`tier`/`bu` only in the ID toke
 | Broker JWKS via `*.svc.cluster.local` | 401 `No matching key found for kid` (SSRF block); via LoadBalancer IP: works |
 
 Unit tests (`npm test`, Node 20+, no dependencies) cover the same cases with a stub IdP.
+
+## Verify your IdP (5 minutes, before deploying)
+```bash
+ISSUER="https://idp.example.com/oauth2/default"
+UI=$(curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .userinfo_endpoint)
+T1=$(<your IdP helper> token)                                     # token from a fresh sign-in
+curl -s -H "Authorization: Bearer $T1" "$UI" | jq '{sub, tier, bu}'
+T2=$(<force a refresh, e.g. AIGW_REFRESH_MARGIN=999999 aigw-token token>)   # token from the refresh grant
+curl -s -H "Authorization: Bearer $T2" "$UI" | jq '{sub, tier, bu}'
+```
+Both calls must return your attributes. If only the first does, the broker can't recover them.
 
 ## Requirements
 - An OIDC IdP with discovery (`/.well-known/openid-configuration`), a JWKS, signed **JWT** access tokens and a
